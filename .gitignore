@@ -10,4 +10,10 @@ wheels/
 .venv
 assignment/
 
+# Secrets
+.env
+
+# Agent logs
+logs/
+
 
