@@ -10,6 +10,9 @@ google/gemini-3.1-pro-preview
 anthropic/claude-sonnet-4.6
 
 
+the agent should run in a Docker container, and have a Makefile for spinning it up, etc, and should log to outside of the container
+
+
 ## structure
 
 
