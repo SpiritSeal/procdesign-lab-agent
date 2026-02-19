@@ -30,14 +30,15 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY main.py ./
 
-# Copy the entire assignment directory so the agent can read and edit files
+# Copy the assignment as the initial working state
 COPY assignment/ ./assignment/
 
-# Log directory (expected to be bind-mounted from the host)
-VOLUME ["/logs"]
+# Output directory – bind-mounted from the host at runtime.
+# Contains agent.log, costs.json, and a copy of the final assignment files.
+VOLUME ["/output"]
 
 ENV ASSIGNMENT_DIR=/app/assignment
-ENV LOG_DIR=/logs
+ENV OUTPUT_DIR=/output
 ENV MODEL_PLAN=gemini-3.1-pro-preview
 ENV MODEL_LOOP=gemini-3-flash-preview
 ENV EDIT_MODE=full

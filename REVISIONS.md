@@ -209,3 +209,106 @@ logs/agent_YYYYMMDD_HHMMSS.log
 - `make logs` tails the most recent `agent_*.log` file.
 - The existing `agent.log` from the first run was renamed to
   `agent_20260219_201635.log` to match the new convention.
+
+---
+
+## Changes (2026-02-19, iteration 4)
+
+### Multi-file edits per response
+
+The agent now processes **all code blocks in a single model response**, rather than
+stopping after the first one. This lets the model edit several files atomically in
+one step — useful when a change spans `define.vh`, `fe_stage.v`, and `agex_stage.v`
+simultaneously.
+
+**Dispatch logic** (`_dispatch_block` + updated `stage3`):
+
+| Block type | Behaviour |
+|---|---|
+| `edit` / `read` | Processed in order; multiple allowed; all results collected |
+| `test` | Processed, results collected, then iteration ends (terminal) |
+| `submit` | Outer loop exits immediately |
+| lang fence / unknown | Error returned; processing continues |
+
+After all blocks are processed, a single combined feedback message is sent with each
+result prefixed by its action type (`[edit]`, `[read]`, `[test]`).
+
+**System prompt changes:**
+- Removed "Output EXACTLY ONE code block" restriction
+- Added explicit statement that multiple `edit`/`read` blocks are allowed
+- Noted that `test` and `submit` must be the last block in a response
+- Updated kickoff message to match
+
+**Parser change:** `re.search` → `re.finditer` in the `stage3` loop.
+
+---
+
+## Changes (2026-02-19, iteration 5)
+
+### Cost tracking
+
+Every `call_model` call now records token usage from `response.usage_metadata` into
+a `CostTracker` instance that lives for the duration of the run.
+
+**`CostTracker`**:
+- `record(model, stage, input_tok, output_tok)` — called automatically inside
+  `call_model`; `stage` is `"stage1"`, `"stage2"`, or `"stage3.iterN"`
+- `log_summary(logger)` — prints per-model and total token/cost breakdown to the log
+- `to_dict()` — serialises full call-by-call detail plus per-model aggregates
+
+**Pricing table** (`MODEL_PRICES`): maps model IDs to `(input_$/1M, output_$/1M)`.
+Covers current Gemini 1.5/2.0/2.5 models; preview models use estimates.
+Unknown models fall back to `_FALLBACK_PRICE = (1.00, 4.00)` with a note in the log.
+
+**`save_output`** (called at end of `main`):
+1. Writes `OUTPUT_DIR/costs.json` — machine-readable breakdown of every API call
+2. Copies the final state of `ASSIGNMENT_DIR` to `OUTPUT_DIR/assignment/`
+
+The cost summary is also logged at INFO level before the agent exits.
+
+---
+
+### Per-run output directory + original assignment preserved
+
+Previously the agent was planned to overwrite `./assignment/` in place, destroying
+the original source files.
+
+**New design**: each `make run` creates `logs/run_TIMESTAMP/` on the host and
+bind-mounts it as `/output` in the container. At the end of the run the agent writes:
+
+```
+logs/run_YYYYMMDD_HHMMSS/
+  agent.log         ← full execution log
+  costs.json        ← token usage and estimated USD cost per call
+  assignment/       ← snapshot of every file as the agent left them
+```
+
+The original `./assignment/` on the host is **never touched** — the container works
+on the `COPY assignment/` layer baked into the image. `assignment/` is back in
+`.gitignore`.
+
+`make logs` now globs `logs/run_*/agent.log` to find the most recent run.
+
+The previous `-v $(ASSIGNMENT_DIR):/app/assignment` mount and `LOG_FILE` env var
+were removed from the Makefile; `OUTPUT_DIR` replaces them.
+
+---
+
+## Changes (2026-02-19, iteration 5)
+
+### Persist agent output to host filesystem
+
+Previously the agent edited files inside `/app/assignment` in the container, which
+were lost when the container exited (`--rm`). The final code was inaccessible.
+
+**Fix:** `make run` now bind-mounts `./assignment` into the container:
+```
+-v $(ASSIGNMENT_DIR):/app/assignment
+```
+All edits the agent makes are written directly to the host's `./assignment/` directory
+and persist after the container exits. The volume shadows the `COPY assignment/`
+layer baked into the image, so the container still starts with the original files
+(from the host copy) and writes back to them in place.
+
+`assignment/` was also removed from `.gitignore` so the agent's output can be
+committed.

@@ -14,20 +14,23 @@ Environment variables:
   MODEL           – overrides both MODEL_PLAN and MODEL_LOOP if set
   EDIT_MODE       – "full" (default) or "diff"
   ASSIGNMENT_DIR  – path to the assignment directory (default: /app/assignment)
-  LOG_DIR         – path where agent.log is written (default: /logs)
+  OUTPUT_DIR      – directory for log, cost report, and final files (default: /output)
   MAX_ITERATIONS  – stage-3 iteration cap (default: 60)
 """
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import logging
+from dataclasses import dataclass, field
 
 from google import genai
 from google.genai import types
 
 # ---------------------------------------------------------------------------
-# Configuration (can be overridden via environment variables)
+# Configuration
 # ---------------------------------------------------------------------------
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
@@ -37,13 +40,11 @@ MODEL_LOOP = _model_override or os.environ.get("MODEL_LOOP", "gemini-3-flash-pre
 
 EDIT_MODE      = os.environ.get("EDIT_MODE", "full")   # "full" | "diff"
 ASSIGNMENT_DIR = os.environ.get("ASSIGNMENT_DIR", "/app/assignment")
-LOG_DIR        = os.environ.get("LOG_DIR", "/logs")
 MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "60"))
 
-# Timestamped log file – injected by the Makefile via LOG_FILE; falls back to
-# a name generated at import time so the agent works outside Docker too.
-_ts      = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_FILE = os.environ.get("LOG_FILE", os.path.join(LOG_DIR, f"agent_{_ts}.log"))
+_ts        = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", f"/output")
+LOG_FILE   = os.path.join(OUTPUT_DIR, "agent.log")
 
 # Language fence names the model might mistakenly use instead of ```edit
 LANG_FENCES = {
@@ -60,11 +61,139 @@ _DIFF_BLOCK_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Cost tracking
+# ---------------------------------------------------------------------------
+
+# USD per 1M tokens: (input, output).
+# Preview model prices are estimates – update when Google publishes official rates.
+MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "gemini-3.1-pro-preview":  (1.25,  5.00),
+    "gemini-3-flash-preview":  (0.075, 0.30),
+    "gemini-2.5-pro-preview":  (1.25,  10.00),
+    "gemini-2.0-pro-exp":      (0.0,   0.0),   # free during experiment
+    "gemini-2.0-flash":        (0.075, 0.30),
+    "gemini-2.0-flash-lite":   (0.019, 0.075),
+    "gemini-1.5-pro":          (1.25,  5.00),
+    "gemini-1.5-flash":        (0.075, 0.30),
+}
+_FALLBACK_PRICE = (1.00, 4.00)  # used for any model not in the table
+
+
+@dataclass
+class _CallRecord:
+    model:        str
+    stage:        str
+    input_tok:    int
+    output_tok:   int
+    input_cost:   float
+    output_cost:  float
+
+    @property
+    def total_cost(self) -> float:
+        return self.input_cost + self.output_cost
+
+
+class CostTracker:
+    def __init__(self):
+        self._calls: list[_CallRecord] = []
+
+    def record(self, model: str, stage: str, input_tok: int, output_tok: int) -> None:
+        in_p, out_p = MODEL_PRICES.get(model, _FALLBACK_PRICE)
+        self._calls.append(_CallRecord(
+            model=model, stage=stage,
+            input_tok=input_tok, output_tok=output_tok,
+            input_cost=input_tok * in_p / 1_000_000,
+            output_cost=output_tok * out_p / 1_000_000,
+        ))
+
+    @property
+    def total_cost(self) -> float:
+        return sum(c.total_cost for c in self._calls)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(c.input_tok for c in self._calls)
+
+    @property
+    def total_output_tokens(self) -> int:
+        return sum(c.output_tok for c in self._calls)
+
+    def log_summary(self, logger: logging.Logger) -> None:
+        logger.info("============================================================")
+        logger.info("Cost Summary")
+        logger.info("============================================================")
+
+        # Aggregate by model
+        agg: dict[str, dict] = {}
+        for c in self._calls:
+            if c.model not in agg:
+                agg[c.model] = {"calls": 0, "input_tok": 0, "output_tok": 0, "cost": 0.0}
+            agg[c.model]["calls"]      += 1
+            agg[c.model]["input_tok"]  += c.input_tok
+            agg[c.model]["output_tok"] += c.output_tok
+            agg[c.model]["cost"]       += c.total_cost
+
+        unknown_models = [m for m in agg if m not in MODEL_PRICES]
+        for model, s in agg.items():
+            est = " (estimated)" if model not in MODEL_PRICES else ""
+            logger.info(
+                "  %-35s %3d calls  %8s in  %8s out  $%.5f%s",
+                model, s["calls"],
+                f"{s['input_tok']:,}", f"{s['output_tok']:,}",
+                s["cost"], est,
+            )
+        logger.info(
+            "  %-35s          %8s in  %8s out  $%.5f",
+            "TOTAL", f"{self.total_input_tokens:,}", f"{self.total_output_tokens:,}",
+            self.total_cost,
+        )
+        if unknown_models:
+            in_p, out_p = _FALLBACK_PRICE
+            logger.info(
+                "  Note: unknown models estimated at $%.2f/$%.2f per 1M tokens",
+                in_p, out_p,
+            )
+
+    def to_dict(self) -> dict:
+        agg: dict[str, dict] = {}
+        for c in self._calls:
+            if c.model not in agg:
+                agg[c.model] = {
+                    "calls": 0, "input_tokens": 0, "output_tokens": 0,
+                    "cost_usd": 0.0, "price_known": c.model in MODEL_PRICES,
+                }
+            agg[c.model]["calls"]         += 1
+            agg[c.model]["input_tokens"]  += c.input_tok
+            agg[c.model]["output_tokens"] += c.output_tok
+            agg[c.model]["cost_usd"]      += c.total_cost
+
+        return {
+            "total_cost_usd":      round(self.total_cost, 6),
+            "total_input_tokens":  self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "by_model": {
+                m: {**s, "cost_usd": round(s["cost_usd"], 6)}
+                for m, s in agg.items()
+            },
+            "calls": [
+                {
+                    "model":        c.model,
+                    "stage":        c.stage,
+                    "input_tokens": c.input_tok,
+                    "output_tokens":c.output_tok,
+                    "cost_usd":     round(c.total_cost, 6),
+                }
+                for c in self._calls
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def setup_logging() -> logging.Logger:
-    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     fmt = "%(asctime)s %(levelname)s %(message)s"
     logging.basicConfig(
         level=logging.INFO,
@@ -105,17 +234,13 @@ def read_file(path: str) -> str:
 
 
 def _build_contents(messages: list) -> list[types.Content]:
-    """Convert OpenAI-style message list to Google GenAI Contents.
-
-    System messages are handled separately via GenerateContentConfig;
-    this function skips them so callers must extract system content first.
-    """
+    """Convert OpenAI-style message list to Google GenAI Contents (skips system)."""
     contents = []
     for msg in messages:
         role = msg["role"]
         text = msg["content"]
         if role == "system":
-            continue  # handled via config
+            continue
         google_role = "model" if role == "assistant" else "user"
         contents.append(
             types.Content(role=google_role, parts=[types.Part(text=text)])
@@ -124,7 +249,6 @@ def _build_contents(messages: list) -> list[types.Content]:
 
 
 def _extract_system(messages: list) -> str | None:
-    """Return the content of the first system message, or None."""
     for msg in messages:
         if msg["role"] == "system":
             return msg["content"]
@@ -135,9 +259,10 @@ def call_model(
     client: genai.Client,
     messages: list,
     model: str,
+    stage: str,
+    tracker: CostTracker,
     logger: logging.Logger,
 ) -> str:
-    # Strip google/ prefix if present (OpenRouter uses it; native API does not)
     model_id = model.removeprefix("google/")
     logger.debug("Calling model %s with %d messages", model_id, len(messages))
 
@@ -146,13 +271,22 @@ def call_model(
         system_instruction=system_text,
     ) if system_text else None
 
-    contents = _build_contents(messages)
-
     response = client.models.generate_content(
         model=model_id,
         config=config,
-        contents=contents,
+        contents=_build_contents(messages),
     )
+
+    # Record token usage for cost tracking
+    usage = response.usage_metadata
+    if usage:
+        tracker.record(
+            model=model_id,
+            stage=stage,
+            input_tok=usage.prompt_token_count or 0,
+            output_tok=usage.candidates_token_count or 0,
+        )
+
     return response.text or ""
 
 
@@ -160,7 +294,7 @@ def call_model(
 # Stage 1: Ask the model which files it needs to see
 # ---------------------------------------------------------------------------
 
-def stage1(client: genai.Client, logger: logging.Logger):
+def stage1(client: genai.Client, tracker: CostTracker, logger: logging.Logger):
     tree_output = get_tree(ASSIGNMENT_DIR)
     readme_path = os.path.join(ASSIGNMENT_DIR, "README.md")
     readme_text = read_file(readme_path)
@@ -182,7 +316,7 @@ def stage1(client: genai.Client, logger: logging.Logger):
 
     messages = [{"role": "user", "content": prompt}]
     logger.info("=== Stage 1: probing for required files ===")
-    response = call_model(client, messages, MODEL_PLAN, logger)
+    response = call_model(client, messages, MODEL_PLAN, "stage1", tracker, logger)
     logger.info("Stage 1 response:\n%s", response)
 
     match = re.search(r"```output\n(.*?)```", response, re.DOTALL)
@@ -213,6 +347,7 @@ def stage2(
     messages1: list,
     response1: str,
     file_list: list,
+    tracker: CostTracker,
     logger: logging.Logger,
 ):
     sections = []
@@ -236,7 +371,7 @@ def stage2(
     ]
 
     logger.info("=== Stage 2: generating implementation plan ===")
-    plan = call_model(client, messages, MODEL_PLAN, logger)
+    plan = call_model(client, messages, MODEL_PLAN, "stage2", tracker, logger)
     logger.info("Stage 2 plan:\n%s", plan)
     return messages, plan
 
@@ -246,7 +381,6 @@ def stage2(
 # ---------------------------------------------------------------------------
 
 def _write_file(rel_path: str, content: str, logger: logging.Logger) -> str:
-    """Write content to ASSIGNMENT_DIR/rel_path; return a status message."""
     full_path = os.path.join(ASSIGNMENT_DIR, rel_path)
     try:
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
@@ -263,15 +397,7 @@ def _write_file(rel_path: str, content: str, logger: logging.Logger) -> str:
 
 
 def execute_edit_full(body: str, logger: logging.Logger) -> str:
-    """Full-file overwrite mode.
-
-    Block format:
-        ```edit
-        ./path/to/file
-        <complete new file content>
-        ```
-    """
-    lines = body.split("\n", 1)
+    lines        = body.split("\n", 1)
     rel_path     = lines[0].strip().lstrip("./")
     file_content = lines[1] if len(lines) > 1 else ""
 
@@ -281,33 +407,18 @@ def execute_edit_full(body: str, logger: logging.Logger) -> str:
             "Format: ```edit\\n./path/to/file\\n<complete file content>\\n```"
         )
 
-    # Reject diff/conflict-marker content in full mode
     if re.search(r'^<{7} ', file_content, re.MULTILINE) or \
        re.search(r'^>{7} ', file_content, re.MULTILINE):
         return (
             "Edit REJECTED: content contains diff/conflict markers "
-            "(<<<<<<<  or >>>>>>>). In full edit mode you must write the "
-            "COMPLETE final file – not a diff or patch. "
-            "Remove all markers and write the full file from scratch."
+            "(<<<<<<<  or >>>>>>>). In full edit mode write the COMPLETE final file."
         )
 
     return _write_file(rel_path, file_content, logger)
 
 
 def execute_edit_diff(body: str, logger: logging.Logger) -> str:
-    """Search/replace diff mode.
-
-    Block format (one or more SEARCH/REPLACE pairs):
-        ```edit
-        ./path/to/file
-        <<<<<<< SEARCH
-        exact text to find
-        =======
-        replacement text
-        >>>>>>> REPLACE
-        ```
-    """
-    lines = body.split("\n", 1)
+    lines     = body.split("\n", 1)
     rel_path  = lines[0].strip().lstrip("./")
     diff_body = lines[1] if len(lines) > 1 else ""
 
@@ -338,8 +449,7 @@ def execute_edit_diff(body: str, logger: logging.Logger) -> str:
         count = result.count(search_text)
         if count == 0:
             reports.append(
-                f"SEARCH text NOT FOUND in {rel_path}:\n"
-                f"```\n{search_text[:300]}\n```"
+                f"SEARCH text NOT FOUND in {rel_path}:\n```\n{search_text[:300]}\n```"
             )
         elif count > 1:
             reports.append(
@@ -371,7 +481,6 @@ def execute_edit(body: str, logger: logging.Logger) -> str:
 
 
 def execute_read(body: str, logger: logging.Logger) -> str:
-    """Return the current contents of a file (capped at 150 lines)."""
     rel_path = body.strip().lstrip("./")
     if not rel_path:
         return "Error: no file path provided in the read block."
@@ -397,9 +506,7 @@ def execute_read(body: str, logger: logging.Logger) -> str:
 
 
 def execute_test(logger: logging.Logger) -> str:
-    """Run part4 and part2 test suites and return combined output."""
     all_output = []
-
     for part in ("part4", "part2"):
         logger.info("Running %s tests ...", part)
         result = subprocess.run(
@@ -411,21 +518,17 @@ def execute_test(logger: logging.Logger) -> str:
         )
 
         build_failed = "%Error:" in result.stderr
-
         if build_failed:
-            stderr_excerpt = result.stderr[:3000]
             section = (
                 f"=== {part} tests ===\n"
                 f"BUILD FAILED – Verilator reported errors (no tests ran):\n"
-                f"{stderr_excerpt}"
+                f"{result.stderr[:3000]}"
             )
         else:
             section = f"=== {part} tests ===\n{result.stdout}"
-
             results_log = os.path.join(ASSIGNMENT_DIR, f"{part}_results.log")
             if os.path.exists(results_log):
                 section += "\n--- per-test results ---\n" + read_file(results_log)
-
             if result.stderr.strip():
                 section += f"\n--- stderr ---\n{result.stderr[:2000]}"
 
@@ -442,21 +545,28 @@ def execute_test(logger: logging.Logger) -> str:
 _STAGE3_SYSTEM_BASE = """\
 You are implementing a G-share branch predictor for a RISC-V CPU pipeline \
 (CS3220 Lab 2). Work methodically: edit files, run tests, fix issues, repeat.
-Output EXACTLY ONE code block per response and NOTHING else outside it.
+
+You may output MULTIPLE code blocks in a single response. \
+All ```edit and ```read blocks are processed in order before feedback is returned. \
+Use this to modify several files at once when a change spans multiple files.
 
 {edit_section}
   ```read
   ./path/to/file
   ```
   Read the current on-disk contents of a file.
+  Multiple ```read blocks are allowed in one response.
 
   ```test
   ```
-  Run the test suite. (No content inside this block.)
+  Run the test suite and receive pass/fail results.
+  Must be the LAST block in a response (nothing after it is processed).
+  No content inside this block.
 
   ```submit
   ```
   Mark the assignment as complete. Only use once all tests pass.
+  Must be the LAST block in a response.
 
 IMPORTANT: Use ONLY the fence types listed above. \
 Do NOT use ```verilog, ```c, ```cpp, or any other language identifier.
@@ -470,6 +580,7 @@ Available actions:
   <complete new file content>
   ```
   Write (or overwrite) the file with the COMPLETE content.
+  Multiple ```edit blocks are allowed in one response to update several files at once.
   RULES:
   - First line MUST be the file path (e.g. ./define.vh)
   - All remaining lines are the ENTIRE new file – every line, nothing omitted
@@ -488,7 +599,8 @@ Available actions:
   replacement text
   >>>>>>> REPLACE
   ```
-  Apply targeted search-and-replace edits to the file.
+  Apply targeted search-and-replace edits to a file.
+  Multiple ```edit blocks are allowed in one response to update several files at once.
   RULES:
   - First line MUST be the file path (e.g. ./define.vh)
   - Use one or more SEARCH/REPLACE pairs (applied top-to-bottom)
@@ -506,16 +618,52 @@ STAGE3_SYSTEM = _STAGE3_SYSTEM_BASE.format(
 # Stage 3: Execution loop
 # ---------------------------------------------------------------------------
 
+def _dispatch_block(action: str, body: str, logger: logging.Logger) -> tuple[str, bool, bool]:
+    """Process one parsed code block.
+
+    Returns (result_text, is_terminal, submitted).
+    is_terminal → stop processing further blocks this iteration.
+    submitted   → exit the outer loop entirely.
+    """
+    if action == "submit":
+        logger.info("=== SUBMITTED – agent complete ===")
+        return "", True, True
+
+    if action == "edit":
+        return execute_edit(body, logger), False, False
+
+    if action == "read":
+        return execute_read(body, logger), False, False
+
+    if action == "test":
+        return execute_test(logger), True, False
+
+    if action in LANG_FENCES:
+        msg = (
+            f"Invalid fence type '```{action}'. "
+            "To write a file use:\n"
+            "```edit\n./path/to/file\n<…>\n```\n"
+            "Valid fence types are: edit, read, test, submit."
+        )
+        logger.warning("Model used language fence '%s' instead of 'edit'", action)
+        return msg, False, False
+
+    msg = f"Unknown action '{action}'. Valid actions are: edit, read, test, submit."
+    logger.warning("Unknown action: %s", action)
+    return msg, False, False
+
+
 def stage3(
     client: genai.Client,
     messages2: list,
     plan: str,
+    tracker: CostTracker,
     logger: logging.Logger,
 ):
     kickoff = (
         "The plan is ready. Now implement it step by step.\n"
-        "Output EXACTLY ONE code block per response and NOTHING else outside it.\n"
-        "Start by reading the first file you need to modify, then edit it."
+        "You may output multiple code blocks in one response to edit several files at once.\n"
+        "Start by reading the files you need to modify, then edit them."
     )
 
     messages = (
@@ -532,61 +680,83 @@ def stage3(
     for iteration in range(1, MAX_ITERATIONS + 1):
         logger.info("--- Iteration %d ---", iteration)
 
-        response = call_model(client, messages, MODEL_LOOP, logger)
+        response = call_model(client, messages, MODEL_LOOP, f"stage3.iter{iteration}", tracker, logger)
         logger.info("Model:\n%s", response)
 
-        match = re.search(r"```(\w+)\n?(.*?)```", response, re.DOTALL)
-        if not match:
+        blocks = list(re.finditer(r"```(\w+)\n?(.*?)```", response, re.DOTALL))
+        if not blocks:
             feedback = (
-                "No code block found in your response. "
-                "Output EXACTLY ONE code block using ```edit, ```read, ```test, or ```submit."
+                "No code blocks found in your response. "
+                "Output one or more code blocks using ```edit, ```read, ```test, or ```submit."
             )
-            logger.warning("No code block – sending feedback")
+            logger.warning("No code blocks – sending feedback")
             messages = messages + [
                 {"role": "assistant", "content": response},
                 {"role": "user",      "content": feedback},
             ]
             continue
 
-        action = match.group(1).strip().lower()
-        body   = match.group(2)
+        results = []
+        done    = False
 
-        if action == "submit":
-            logger.info("=== SUBMITTED – agent complete ===")
+        for m in blocks:
+            action = m.group(1).strip().lower()
+            body   = m.group(2)
+
+            result, terminal, submitted = _dispatch_block(action, body, logger)
+
+            if submitted:
+                done = True
+                break
+
+            if result:
+                logger.info("Result for '%s' (first 500 chars):\n%s", action, result[:500])
+                results.append(f"[{action}] {result}")
+
+            if terminal:
+                break
+
+        if done:
             break
 
-        elif action == "edit":
-            result = execute_edit(body, logger)
-
-        elif action == "read":
-            result = execute_read(body, logger)
-
-        elif action == "test":
-            result = execute_test(logger)
-
-        elif action in LANG_FENCES:
-            result = (
-                f"Invalid fence type '```{action}'. "
-                "To write a file use:\n"
-                "```edit\n./path/to/file\n<…>\n```\n"
-                "Valid fence types are: edit, read, test, submit."
-            )
-            logger.warning("Model used language fence '%s' instead of 'edit'", action)
-
-        else:
-            result = (
-                f"Unknown action '{action}'. "
-                "Valid actions are: edit, read, test, submit."
-            )
-            logger.warning("Unknown action: %s", action)
-
-        logger.info("Result (first 500 chars):\n%s", result[:500])
+        feedback = "\n\n".join(results) if results else "(all blocks processed with no output)"
         messages = messages + [
             {"role": "assistant", "content": response},
-            {"role": "user",      "content": result},
+            {"role": "user",      "content": feedback},
         ]
     else:
         logger.warning("Max iterations (%d) reached without submit.", MAX_ITERATIONS)
+
+
+# ---------------------------------------------------------------------------
+# Output finalisation
+# ---------------------------------------------------------------------------
+
+def save_output(tracker: CostTracker, logger: logging.Logger) -> None:
+    """Copy final assignment files and write cost report into OUTPUT_DIR."""
+
+    # Cost report (JSON)
+    cost_path = os.path.join(OUTPUT_DIR, "costs.json")
+    try:
+        with open(cost_path, "w") as fh:
+            json.dump(tracker.to_dict(), fh, indent=2)
+        logger.info("Cost report written to %s", cost_path)
+    except Exception as exc:
+        logger.error("Failed to write cost report: %s", exc)
+
+    # Copy final assignment files (skip hidden dirs and test .log files)
+    out_assignment = os.path.join(OUTPUT_DIR, "assignment")
+    try:
+        if os.path.exists(out_assignment):
+            shutil.rmtree(out_assignment)
+        shutil.copytree(
+            ASSIGNMENT_DIR,
+            out_assignment,
+            ignore=shutil.ignore_patterns(".*", "__pycache__"),
+        )
+        logger.info("Final assignment files copied to %s", out_assignment)
+    except Exception as exc:
+        logger.error("Failed to copy assignment files: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +771,7 @@ def main() -> int:
     logger.info("Model (loop):   %s", MODEL_LOOP)
     logger.info("Edit mode:      %s", EDIT_MODE)
     logger.info("Assignment dir: %s", ASSIGNMENT_DIR)
-    logger.info("Log dir:        %s", LOG_DIR)
+    logger.info("Output dir:     %s", OUTPUT_DIR)
     logger.info("Max iterations: %d", MAX_ITERATIONS)
     logger.info("============================================================")
 
@@ -613,11 +783,15 @@ def main() -> int:
         logger.error("EDIT_MODE must be 'full' or 'diff', got: %s", EDIT_MODE)
         return 1
 
-    client = get_client()
+    tracker = CostTracker()
+    client  = get_client()
 
-    messages1, response1, file_list = stage1(client, logger)
-    messages2, plan = stage2(client, messages1, response1, file_list, logger)
-    stage3(client, messages2, plan, logger)
+    messages1, response1, file_list = stage1(client, tracker, logger)
+    messages2, plan = stage2(client, messages1, response1, file_list, tracker, logger)
+    stage3(client, messages2, plan, tracker, logger)
+
+    tracker.log_summary(logger)
+    save_output(tracker, logger)
 
     logger.info("============================================================")
     logger.info("Lab Agent finished")
