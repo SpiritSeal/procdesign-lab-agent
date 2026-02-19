@@ -1,10 +1,19 @@
 
 
 
-structure
+TODO: You are building a minimal agent that will fully complete the coding part of the lab exercise in the ./assignment/ directory.
+
+Use openrouter, and follow the structure provided.
+
+Allowed models:
+google/gemini-3.1-pro-preview
+anthropic/claude-sonnet-4.6
 
 
-[1 reasoning model, low thinking?]
+## structure
+
+
+[1 heavy model, low thinking?]
 
 `tree` +
 `cat README.md` +
@@ -20,7 +29,7 @@ You will create a plan for completing this assignment. Specifify the files you n
 output just this output code block and nothing else; we will give them back to you in the next step
 [/1]
 
-[2 reasoning model, high thinking]
+[2 heavy model, high thinking]
 
 prev 2 messages +
 `cat ...` +
@@ -28,10 +37,10 @@ Create the plan for completing this assignment
 [/2]
 
 (while true)
-    
-This stage has multiple different options
 
-    [3]
+[3]
+This stage has multiple different options depending on what you put as ```option
+
     ```edit
     ./name_of_file_to_edit
     Full file with modifications (rest of file)
@@ -40,25 +49,19 @@ This stage has multiple different options
     The first line will be interpreted as the relative path of the file
     The rest of the file is treated as the full, new, updated file
 
-    [/3]
-
-    [4]
     ```test
     ```
 
     runs `make test`
-    [/4]
-
-    [5]
     ```submit
     ```
     Marks the assignment as completed and conclude. You will be unable to make actions once you use this command
-    [/5]
-
-
 
     Output just one codeblock containing the operation and content if applicable, and nothing else
 
+
+
+[/3]
 (end while)
 
 
