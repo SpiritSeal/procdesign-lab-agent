@@ -5,5 +5,5 @@ description = "LLM agent that completes CS3220 Lab #2 (Branch Prediction)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "openai>=1.0.0",
+    "google-genai>=1.0.0",
 ]

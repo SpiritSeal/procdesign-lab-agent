@@ -160,3 +160,52 @@ cheaper while still capable of targeted code edits.
 
 `MODEL` removed as a top-level variable; replaced with `MODEL_PLAN`, `MODEL_LOOP`,
 and `EDIT_MODE`. All three are forwarded into the container via `-e` flags.
+
+---
+
+## Changes (2026-02-19, iteration 3)
+
+### Switch to Google GenAI SDK (native)
+
+Replaced OpenRouter + `openai` package with the native `google-genai` SDK.
+
+| Before | After |
+|---|---|
+| `openai` pip package | `google-genai` pip package |
+| `OPENROUTER_API_KEY` env var | `GOOGLE_API_KEY` env var |
+| `OpenAI(base_url="https://openrouter.ai/…")` | `genai.Client(api_key=…)` |
+| `client.chat.completions.create(…)` | `client.models.generate_content(…)` |
+| OpenAI message roles (`assistant`) | Google roles (`model`) |
+| System message in `messages` list | `GenerateContentConfig(system_instruction=…)` |
+
+**Message conversion** (`_build_contents`, `_extract_system`): system messages are
+extracted and passed via `GenerateContentConfig`; `"assistant"` role is mapped to
+`"model"` for the Google API. The rest of the agent code is unchanged.
+
+**Model name handling**: the `google/` prefix used by OpenRouter is stripped via
+`.removeprefix("google/")` before calling the native API.
+
+**Default model names** updated to drop the `google/` prefix:
+- `MODEL_PLAN` default: `gemini-3.1-pro-preview`
+- `MODEL_LOOP` default: `gemini-3-flash-preview`
+
+`Dockerfile` and `pyproject.toml` updated accordingly.
+
+---
+
+### Timestamped log files + logs tracked in git
+
+Each run now writes to a uniquely named file:
+```
+logs/agent_YYYYMMDD_HHMMSS.log
+```
+
+- The Makefile computes `RUN_TS=$(shell date +%Y%m%d_%H%M%S)` and passes
+  `LOG_FILE=/logs/agent_<RUN_TS>.log` into the container via `-e`.
+- `main.py` reads `LOG_FILE` (falls back to generating its own timestamp when run
+  outside Docker).
+- `logs/` is now tracked in git (removed from `.gitignore`); `logs/.gitkeep`
+  ensures the directory exists in fresh checkouts.
+- `make logs` tails the most recent `agent_*.log` file.
+- The existing `agent.log` from the first run was renamed to
+  `agent_20260219_201635.log` to match the new convention.

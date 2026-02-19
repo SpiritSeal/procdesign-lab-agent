@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lab Agent - Completes CS3220 Lab #2 (Branch Prediction) using an LLM via OpenRouter.
+Lab Agent - Completes CS3220 Lab #2 (Branch Prediction) using Google Generative AI.
 
 Pipeline:
   Stage 1 (planning probe): Give the model tree + README; it lists files it needs.
@@ -8,14 +8,14 @@ Pipeline:
   Stage 3 (execution loop): The model iteratively edits files, runs tests, and submits.
 
 Environment variables:
-  OPENROUTER_API_KEY  – required
-  MODEL_PLAN          – model for stages 1+2  (default: google/gemini-3.1-pro-preview)
-  MODEL_LOOP          – model for stage 3 loop (default: google/gemini-3-flash-preview)
-  MODEL               – overrides both MODEL_PLAN and MODEL_LOOP if set
-  EDIT_MODE           – "full" (default) or "diff"
-  ASSIGNMENT_DIR      – path to the assignment directory (default: /app/assignment)
-  LOG_DIR             – path where agent.log is written (default: /logs)
-  MAX_ITERATIONS      – stage-3 iteration cap (default: 60)
+  GOOGLE_API_KEY  – required
+  MODEL_PLAN      – model for stages 1+2  (default: gemini-3.1-pro-preview)
+  MODEL_LOOP      – model for stage 3 loop (default: gemini-3-flash-preview)
+  MODEL           – overrides both MODEL_PLAN and MODEL_LOOP if set
+  EDIT_MODE       – "full" (default) or "diff"
+  ASSIGNMENT_DIR  – path to the assignment directory (default: /app/assignment)
+  LOG_DIR         – path where agent.log is written (default: /logs)
+  MAX_ITERATIONS  – stage-3 iteration cap (default: 60)
 """
 
 import os
@@ -23,21 +23,27 @@ import re
 import subprocess
 import logging
 
-from openai import OpenAI
+from google import genai
+from google.genai import types
 
 # ---------------------------------------------------------------------------
 # Configuration (can be overridden via environment variables)
 # ---------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 _model_override = os.environ.get("MODEL", "")
-MODEL_PLAN = _model_override or os.environ.get("MODEL_PLAN", "google/gemini-3.1-pro-preview")
-MODEL_LOOP = _model_override or os.environ.get("MODEL_LOOP", "google/gemini-3-flash-preview")
+MODEL_PLAN = _model_override or os.environ.get("MODEL_PLAN", "gemini-3.1-pro-preview")
+MODEL_LOOP = _model_override or os.environ.get("MODEL_LOOP", "gemini-3-flash-preview")
 
 EDIT_MODE      = os.environ.get("EDIT_MODE", "full")   # "full" | "diff"
 ASSIGNMENT_DIR = os.environ.get("ASSIGNMENT_DIR", "/app/assignment")
 LOG_DIR        = os.environ.get("LOG_DIR", "/logs")
 MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "60"))
+
+# Timestamped log file – injected by the Makefile via LOG_FILE; falls back to
+# a name generated at import time so the agent works outside Docker too.
+_ts      = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_FILE = os.environ.get("LOG_FILE", os.path.join(LOG_DIR, f"agent_{_ts}.log"))
 
 # Language fence names the model might mistakenly use instead of ```edit
 LANG_FENCES = {
@@ -46,12 +52,7 @@ LANG_FENCES = {
     'ts', 'typescript', 'json', 'yaml', 'toml', 'text', 'txt', 'plaintext',
 }
 
-# Markers used by the diff-mode SEARCH/REPLACE format
-_DIFF_SEARCH  = "<<<<<<< SEARCH"
-_DIFF_SEP     = "======="
-_DIFF_REPLACE = ">>>>>>> REPLACE"
-
-# Regex to find all SEARCH/REPLACE blocks inside an edit body
+# Regex to find all SEARCH/REPLACE blocks inside a diff-mode edit body
 _DIFF_BLOCK_RE = re.compile(
     r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE",
     re.DOTALL,
@@ -69,18 +70,15 @@ def setup_logging() -> logging.Logger:
         level=logging.INFO,
         format=fmt,
         handlers=[
-            logging.FileHandler(os.path.join(LOG_DIR, "agent.log")),
+            logging.FileHandler(LOG_FILE),
             logging.StreamHandler(),
         ],
     )
     return logging.getLogger("lab-agent")
 
 
-def get_client() -> OpenAI:
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-    )
+def get_client() -> genai.Client:
+    return genai.Client(api_key=GOOGLE_API_KEY)
 
 
 def get_tree(path: str) -> str:
@@ -106,25 +104,63 @@ def read_file(path: str) -> str:
         return f"[Error reading {path}: {exc}]"
 
 
+def _build_contents(messages: list) -> list[types.Content]:
+    """Convert OpenAI-style message list to Google GenAI Contents.
+
+    System messages are handled separately via GenerateContentConfig;
+    this function skips them so callers must extract system content first.
+    """
+    contents = []
+    for msg in messages:
+        role = msg["role"]
+        text = msg["content"]
+        if role == "system":
+            continue  # handled via config
+        google_role = "model" if role == "assistant" else "user"
+        contents.append(
+            types.Content(role=google_role, parts=[types.Part(text=text)])
+        )
+    return contents
+
+
+def _extract_system(messages: list) -> str | None:
+    """Return the content of the first system message, or None."""
+    for msg in messages:
+        if msg["role"] == "system":
+            return msg["content"]
+    return None
+
+
 def call_model(
-    client: OpenAI,
+    client: genai.Client,
     messages: list,
     model: str,
     logger: logging.Logger,
 ) -> str:
-    logger.debug("Calling model %s with %d messages", model, len(messages))
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
+    # Strip google/ prefix if present (OpenRouter uses it; native API does not)
+    model_id = model.removeprefix("google/")
+    logger.debug("Calling model %s with %d messages", model_id, len(messages))
+
+    system_text = _extract_system(messages)
+    config = types.GenerateContentConfig(
+        system_instruction=system_text,
+    ) if system_text else None
+
+    contents = _build_contents(messages)
+
+    response = client.models.generate_content(
+        model=model_id,
+        config=config,
+        contents=contents,
     )
-    return response.choices[0].message.content or ""
+    return response.text or ""
 
 
 # ---------------------------------------------------------------------------
 # Stage 1: Ask the model which files it needs to see
 # ---------------------------------------------------------------------------
 
-def stage1(client: OpenAI, logger: logging.Logger):
+def stage1(client: genai.Client, logger: logging.Logger):
     tree_output = get_tree(ASSIGNMENT_DIR)
     readme_path = os.path.join(ASSIGNMENT_DIR, "README.md")
     readme_text = read_file(readme_path)
@@ -173,7 +209,7 @@ def stage1(client: OpenAI, logger: logging.Logger):
 # ---------------------------------------------------------------------------
 
 def stage2(
-    client: OpenAI,
+    client: genai.Client,
     messages1: list,
     response1: str,
     file_list: list,
@@ -252,8 +288,7 @@ def execute_edit_full(body: str, logger: logging.Logger) -> str:
             "Edit REJECTED: content contains diff/conflict markers "
             "(<<<<<<<  or >>>>>>>). In full edit mode you must write the "
             "COMPLETE final file – not a diff or patch. "
-            "Remove all markers and write the full file from scratch. "
-            "Alternatively, switch to diff mode with the ```edit SEARCH/REPLACE format."
+            "Remove all markers and write the full file from scratch."
         )
 
     return _write_file(rel_path, file_content, logger)
@@ -271,19 +306,15 @@ def execute_edit_diff(body: str, logger: logging.Logger) -> str:
         replacement text
         >>>>>>> REPLACE
         ```
-
-    Rules:
-    - SEARCH text must appear exactly once in the file.
-    - Multiple pairs are applied top-to-bottom in a single pass.
     """
     lines = body.split("\n", 1)
-    rel_path      = lines[0].strip().lstrip("./")
-    diff_body     = lines[1] if len(lines) > 1 else ""
+    rel_path  = lines[0].strip().lstrip("./")
+    diff_body = lines[1] if len(lines) > 1 else ""
 
     if not rel_path:
         return (
             "Error: no file path on the first line of the edit block.\n"
-            "Format: ```edit\\n./path/to/file\\n<<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE\\n```"
+            "Format: ```edit\\n./path/to/file\\n<<<<<<< SEARCH\\n...\\n```"
         )
 
     full_path = os.path.join(ASSIGNMENT_DIR, rel_path)
@@ -323,14 +354,12 @@ def execute_edit_diff(body: str, logger: logging.Logger) -> str:
     if reports:
         error_block = "\n\n".join(reports)
         if applied > 0:
-            # Some blocks succeeded – still write partial changes
             _write_file(rel_path, result, logger)
             return (
                 f"Partially applied {applied}/{len(blocks)} change(s) to {rel_path}. "
                 f"The following blocks failed:\n\n{error_block}"
             )
-        else:
-            return f"No changes applied to {rel_path}.\n\n{error_block}"
+        return f"No changes applied to {rel_path}.\n\n{error_block}"
 
     return _write_file(rel_path, result, logger)
 
@@ -352,7 +381,7 @@ def execute_read(body: str, logger: logging.Logger) -> str:
     if content.startswith("[Error"):
         return content
 
-    lines    = content.splitlines()
+    lines     = content.splitlines()
     MAX_LINES = 150
     if len(lines) > MAX_LINES:
         shown  = "\n".join(lines[:MAX_LINES])
@@ -478,7 +507,7 @@ STAGE3_SYSTEM = _STAGE3_SYSTEM_BASE.format(
 # ---------------------------------------------------------------------------
 
 def stage3(
-    client: OpenAI,
+    client: genai.Client,
     messages2: list,
     plan: str,
     logger: logging.Logger,
@@ -576,8 +605,8 @@ def main() -> int:
     logger.info("Max iterations: %d", MAX_ITERATIONS)
     logger.info("============================================================")
 
-    if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY is not set – aborting.")
+    if not GOOGLE_API_KEY:
+        logger.error("GOOGLE_API_KEY is not set – aborting.")
         return 1
 
     if EDIT_MODE not in ("full", "diff"):

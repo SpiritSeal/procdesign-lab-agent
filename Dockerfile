@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies system-wide (no venv needed in a container)
-RUN pip3 install --break-system-packages openai
+RUN pip3 install --break-system-packages google-genai
 
 WORKDIR /app
 
@@ -38,7 +38,9 @@ VOLUME ["/logs"]
 
 ENV ASSIGNMENT_DIR=/app/assignment
 ENV LOG_DIR=/logs
-ENV MODEL=anthropic/claude-sonnet-4-6
+ENV MODEL_PLAN=gemini-3.1-pro-preview
+ENV MODEL_LOOP=gemini-3-flash-preview
+ENV EDIT_MODE=full
 ENV MAX_ITERATIONS=60
 
 CMD ["python3", "main.py"]
