@@ -1,0 +1,114 @@
+{
+  "total_cost_usd": 0.134931,
+  "total_input_tokens": 829752,
+  "total_output_tokens": 58070,
+  "by_model": {
+    "gemini-3.1-pro-preview": {
+      "calls": 2,
+      "input_tokens": 29458,
+      "output_tokens": 4397,
+      "cost_usd": 0.058807,
+      "price_known": true
+    },
+    "gemini-3-flash-preview": {
+      "calls": 11,
+      "input_tokens": 800294,
+      "output_tokens": 53673,
+      "cost_usd": 0.076124,
+      "price_known": true
+    }
+  },
+  "calls": [
+    {
+      "model": "gemini-3.1-pro-preview",
+      "stage": "stage1",
+      "input_tokens": 6956,
+      "output_tokens": 43,
+      "cost_usd": 0.00891
+    },
+    {
+      "model": "gemini-3.1-pro-preview",
+      "stage": "stage2",
+      "input_tokens": 22502,
+      "output_tokens": 4354,
+      "cost_usd": 0.049897
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter1",
+      "input_tokens": 27271,
+      "output_tokens": 15573,
+      "cost_usd": 0.006717
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter2",
+      "input_tokens": 45673,
+      "output_tokens": 9311,
+      "cost_usd": 0.006219
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter3",
+      "input_tokens": 57780,
+      "output_tokens": 6365,
+      "cost_usd": 0.006243
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter4",
+      "input_tokens": 64758,
+      "output_tokens": 3142,
+      "cost_usd": 0.005799
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter5",
+      "input_tokens": 70421,
+      "output_tokens": 7293,
+      "cost_usd": 0.007469
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter6",
+      "input_tokens": 79466,
+      "output_tokens": 4943,
+      "cost_usd": 0.007443
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter7",
+      "input_tokens": 84903,
+      "output_tokens": 5881,
+      "cost_usd": 0.008132
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter8",
+      "input_tokens": 91397,
+      "output_tokens": 9,
+      "cost_usd": 0.006857
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter9",
+      "input_tokens": 91742,
+      "output_tokens": 1143,
+      "cost_usd": 0.007224
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter10",
+      "input_tokens": 93269,
+      "output_tokens": 9,
+      "cost_usd": 0.006998
+    },
+    {
+      "model": "gemini-3-flash-preview",
+      "stage": "stage3.iter11",
+      "input_tokens": 93614,
+      "output_tokens": 4,
+      "cost_usd": 0.007022
+    }
+  ]
+}
